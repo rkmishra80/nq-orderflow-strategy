@@ -27,7 +27,7 @@ Features:
    - Trailing Stop Loss / CTC (Chasing The Close / Breakeven lock)
 """
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -109,24 +109,149 @@ def calculate_volume_profile(
     }
 
 
-def compute_session_profiles(trades_df: pd.DataFrame, tick_size: float = 1.0) -> Dict:
+def calculate_levels_from_vp(vp_series: pd.Series, va_pct: float = 0.70) -> Tuple[float, float, float, List[float]]:
     """
-    RTH (09:30 - 16:00 ET) aur ETH (Overnight) session ke alag alag Volume Profiles banata hai.
+    Given a sorted price-volume Series, computes POC, VAH, VAL, and LVNs.
+    """
+    if vp_series.empty or vp_series.sum() == 0:
+        return np.nan, np.nan, np.nan, []
+
+    poc = float(vp_series.idxmax())
+    total_volume = float(vp_series.sum())
+    target_va_vol = total_volume * va_pct
+
+    poc_idx = vp_series.index.get_loc(poc)
+    accum_vol = float(vp_series.iloc[poc_idx])
+    up_idx = poc_idx + 1
+    down_idx = poc_idx - 1
+    n = len(vp_series)
+
+    while accum_vol < target_va_vol and (up_idx < n or down_idx >= 0):
+        vol_up = float(vp_series.iloc[up_idx]) if up_idx < n else 0.0
+        vol_down = float(vp_series.iloc[down_idx]) if down_idx >= 0 else 0.0
+        if vol_up >= vol_down and up_idx < n:
+            accum_vol += vol_up
+            up_idx += 1
+        elif down_idx >= 0:
+            accum_vol += vol_down
+            down_idx -= 1
+        else:
+            up_idx += 1
+
+    val = float(vp_series.index[max(0, down_idx + 1)])
+    vah = float(vp_series.index[min(n - 1, up_idx - 1)])
+
+    # LVNs: local valleys with smoothed VP
+    smoothed = vp_series.rolling(window=5, center=True).mean().dropna()
+    lvns = []
+    avg_vol = float(vp_series.mean())
+    for i in range(1, len(smoothed) - 1):
+        if (smoothed.iloc[i] < smoothed.iloc[i - 1]) and (smoothed.iloc[i] < smoothed.iloc[i + 1]) and (smoothed.iloc[i] < (avg_vol * 0.65)):
+            lvns.append(float(smoothed.index[i]))
+
+    return poc, vah, val, lvns
+
+
+def compute_session_profiles(
+    trades_df: pd.DataFrame,
+    bar_index: pd.DatetimeIndex = None,
+    tick_size: float = 1.0,
+    va_pct: float = 0.70
+) -> Dict:
+    """
+    RTH (09:30 - 16:00 ET) aur ETH (Overnight) session ke Volume Profiles banata hai.
+
+    Causal / Expanding Mode (Zero Look-Ahead Bias):
+    Jab bar_index provide kiya jata hai, har bar t ke liye RTH profile strictly [09:30, bar_t]
+    tak ke volume se banta hai. Jaise-jaise din aage badhta hai, profile expand hota hai.
+    Overnight ETH profile 09:30 baje fully complete hoti hai aur pure RTH ke liye fixed rehti hai.
     """
     times = trades_df.index.time
     rth_start = pd.to_datetime("09:30").time()
     rth_end = pd.to_datetime("16:00").time()
 
-    rth_mask = (times >= rth_start) & (times < rth_end)
-    rth_trades = trades_df[rth_mask]
-    eth_trades = trades_df[~rth_mask]
+    eth_trades = trades_df[times < rth_start]
+    rth_trades = trades_df[(times >= rth_start) & (times < rth_end)]
 
-    rth_profile = calculate_volume_profile(rth_trades["price"], rth_trades["size"], tick_size=tick_size)
-    eth_profile = calculate_volume_profile(eth_trades["price"], eth_trades["size"], tick_size=tick_size)
+    # 1. Overnight ETH Profile (Static throughout RTH session, zero lookahead)
+    eth_profile = calculate_volume_profile(eth_trades["price"], eth_trades["size"], tick_size=tick_size, va_pct=va_pct)
+    rth_profile = calculate_volume_profile(rth_trades["price"], rth_trades["size"], tick_size=tick_size, va_pct=va_pct)
 
+    if bar_index is None:
+        return {
+            "rth": rth_profile,
+            "eth": eth_profile
+        }
+
+    # 2. Causal Expanding RTH Profile bar-by-bar
+    eth_poc = eth_profile.get("poc", np.nan)
+    eth_vah = eth_profile.get("vah", np.nan)
+    eth_val = eth_profile.get("val", np.nan)
+    eth_lvns = eth_profile.get("lvns", [])
+
+    rth_poc, rth_vah, rth_val, rth_lvns = np.nan, np.nan, np.nan, []
+    expanding_records = []
+
+    if rth_trades.empty or len(bar_index) == 0:
+        for bt in bar_index:
+            expanding_records.append({
+                "bar_time": bt,
+                "rth_poc": np.nan, "rth_vah": np.nan, "rth_val": np.nan, "rth_lvns": [],
+                "eth_poc": eth_poc, "eth_vah": eth_vah, "eth_val": eth_val, "eth_lvns": eth_lvns
+            })
+        exp_df = pd.DataFrame(expanding_records).set_index("bar_time")
+        return {
+            "expanding": exp_df,
+            "eth": eth_profile,
+            "rth": rth_profile
+        }
+
+    # Pre-bin RTH trades
+    binned_prices = (np.round(rth_trades["price"].values / tick_size) * tick_size)
+    trade_sizes = rth_trades["size"].values
+    trade_times = rth_trades.index.values
+
+    # Map trades to bar indices
+    bar_times_arr = bar_index.values
+    bar_assigned = np.searchsorted(bar_times_arr, trade_times, side="right") - 1
+
+    df_temp = pd.DataFrame({
+        "bar_idx": bar_assigned,
+        "price": binned_prices,
+        "size": trade_sizes
+    })
+    grouped_bar_vp = df_temp.groupby(["bar_idx", "price"])["size"].sum()
+
+    cum_vp = pd.Series(dtype=float)
+    rth_bars_mask = (bar_index.time >= rth_start) & (bar_index.time < rth_end)
+
+    for idx, bt in enumerate(bar_index):
+        if not rth_bars_mask[idx]:
+            expanding_records.append({
+                "bar_time": bt,
+                "rth_poc": np.nan, "rth_vah": np.nan, "rth_val": np.nan, "rth_lvns": [],
+                "eth_poc": eth_poc, "eth_vah": eth_vah, "eth_val": eth_val, "eth_lvns": eth_lvns
+            })
+            continue
+
+        if idx in grouped_bar_vp.index.levels[0]:
+            bar_vp = grouped_bar_vp.loc[idx]
+            cum_vp = cum_vp.add(bar_vp, fill_value=0).sort_index()
+
+        poc, vah, val, lvns = calculate_levels_from_vp(cum_vp, va_pct=va_pct)
+        rth_poc, rth_vah, rth_val, rth_lvns = poc, vah, val, lvns
+
+        expanding_records.append({
+            "bar_time": bt,
+            "rth_poc": poc, "rth_vah": vah, "rth_val": val, "rth_lvns": lvns,
+            "eth_poc": eth_poc, "eth_vah": eth_vah, "eth_val": eth_val, "eth_lvns": eth_lvns
+        })
+
+    exp_df = pd.DataFrame(expanding_records).set_index("bar_time")
     return {
-        "rth": rth_profile,
-        "eth": eth_profile
+        "expanding": exp_df,
+        "eth": eth_profile,
+        "rth": rth_profile
     }
 
 
@@ -274,23 +399,25 @@ def detect_orderflow_features(bars_df: pd.DataFrame, level_proximity_pts: float 
 
 def generate_orderflow_signals(
     bars_df: pd.DataFrame,
-    profile_levels: Dict,
+    profile_levels: Optional[Dict] = None,
     level_buffer_pts: float = 8.0
 ) -> pd.DataFrame:
     """
-    Volume Profile Levels + Order Flow + VWAP + Time Filter ko combine karke
+    Causal Volume Profile Levels + Order Flow + VWAP + Time Filter ko combine karke
     Trading Signals generate karta hai.
+
+    Zero Look-Ahead:
+    Har bar t ke liye uss bar ke developing RTH VAH/VAL/POC levels ya completed overnight
+    ETH levels ka use karta hai.
     """
     df = bars_df.copy()
 
-    # Extract Key Levels (RTH primary, ETH reference)
-    rth = profile_levels.get("rth", {})
-    eth = profile_levels.get("eth", {})
-
-    vah = rth.get("vah") or eth.get("vah")
-    val = rth.get("val") or eth.get("val")
-    poc = rth.get("poc") or eth.get("poc")
-    lvns = rth.get("lvns", []) + eth.get("lvns", [])
+    # If profile_levels has expanding df, merge into bars if not already present
+    if profile_levels and "expanding" in profile_levels:
+        exp_df = profile_levels["expanding"]
+        for col in exp_df.columns:
+            if col not in df.columns:
+                df[col] = exp_df[col].values
 
     # Signal columns: 1 = Long, -1 = Short, 0 = No trade
     df["signal"] = 0
@@ -322,17 +449,61 @@ def generate_orderflow_signals(
         vwap = bar["vwap"]
         vwap_slope = bar["vwap_slope"]
 
+        # Causal Levels for this specific bar i
+        rth_poc = bar.get("rth_poc", np.nan)
+        rth_vah = bar.get("rth_vah", np.nan)
+        rth_val = bar.get("rth_val", np.nan)
+        rth_lvns = bar.get("rth_lvns", [])
+        if isinstance(rth_lvns, str):
+            rth_lvns = [float(x) for x in rth_lvns.split(",") if x.strip()] if rth_lvns else []
+        elif not isinstance(rth_lvns, list):
+            rth_lvns = []
+
+        eth_poc = bar.get("eth_poc", np.nan)
+        eth_vah = bar.get("eth_vah", np.nan)
+        eth_val = bar.get("eth_val", np.nan)
+        eth_lvns = bar.get("eth_lvns", [])
+        if isinstance(eth_lvns, str):
+            eth_lvns = [float(x) for x in eth_lvns.split(",") if x.strip()] if eth_lvns else []
+        elif not isinstance(eth_lvns, list):
+            eth_lvns = []
+
+        # Fallback to static if expanding not present
+        if np.isnan(rth_poc) and np.isnan(rth_vah) and profile_levels is not None:
+            rth_p = profile_levels.get("rth", {})
+            eth_p = profile_levels.get("eth", {})
+            rth_poc = float(rth_p.get("poc")) if rth_p.get("poc") is not None else np.nan
+            rth_vah = float(rth_p.get("vah")) if rth_p.get("vah") is not None else np.nan
+            rth_val = float(rth_p.get("val")) if rth_p.get("val") is not None else np.nan
+            eth_poc = float(eth_p.get("poc")) if eth_p.get("poc") is not None else np.nan
+            eth_vah = float(eth_p.get("vah")) if eth_p.get("vah") is not None else np.nan
+            eth_val = float(eth_p.get("val")) if eth_p.get("val") is not None else np.nan
+
+        # Active levels: developing RTH preferred, completed ETH secondary
+        vah = rth_vah if not np.isnan(rth_vah) else eth_vah
+        val = rth_val if not np.isnan(rth_val) else eth_val
+        poc = rth_poc if not np.isnan(rth_poc) else eth_poc
+        lvns = rth_lvns + eth_lvns
+
+        if np.isnan(val) and np.isnan(vah):
+            continue
+
         # Level distances
-        dist_val = abs(low - val) if val else 999
-        dist_vah = abs(high - vah) if vah else 999
+        dist_val = 999.0
+        if not np.isnan(rth_val): dist_val = min(dist_val, abs(low - rth_val))
+        if not np.isnan(eth_val): dist_val = min(dist_val, abs(low - eth_val))
+
+        dist_vah = 999.0
+        if not np.isnan(rth_vah): dist_vah = min(dist_vah, abs(high - rth_vah))
+        if not np.isnan(eth_vah): dist_vah = min(dist_vah, abs(high - eth_vah))
 
         # Nearest LVN check
-        dist_lvn = min([abs(close - lvn) for lvn in lvns], default=999) if lvns else 999
+        dist_lvn = min([abs(close - lvn) for lvn in lvns], default=999.0) if lvns else 999.0
 
         # -------------------------------------------------------------
         # A. REVERSAL LONG (Support at VAL / lower LVN / lower VWAP)
         # -------------------------------------------------------------
-        near_support = (dist_val <= level_buffer_pts) or (dist_lvn <= level_buffer_pts and close < poc)
+        near_support = (dist_val <= level_buffer_pts) or (dist_lvn <= level_buffer_pts and (not np.isnan(poc) and close < poc))
         bull_confirmation = (bar["absorption_bull"] or bar["cvd_divergence_bull"]) and (delta > 0)
         vwap_support_confluence = (close <= vwap + 5.0)  # Room to run up to VWAP / POC
 
@@ -341,7 +512,7 @@ def generate_orderflow_signals(
             risk = close - sl
             if risk > 4.0:
                 # Target: POC if above, else VAH, minimum 1:1.8 RR
-                tp_target = poc if (poc and poc > close) else (vah if vah and vah > close else close + (1.8 * risk))
+                tp_target = poc if (not np.isnan(poc) and poc > close) else (vah if not np.isnan(vah) and vah > close else close + (1.8 * risk))
                 tp = max(tp_target, close + (1.8 * risk))
                 df.iloc[i, df.columns.get_loc("signal")] = 1
                 df.iloc[i, df.columns.get_loc("trade_type")] = "REVERSAL_LONG"
@@ -352,7 +523,7 @@ def generate_orderflow_signals(
         # -------------------------------------------------------------
         # B. REVERSAL SHORT (Resistance at VAH / upper LVN / upper VWAP)
         # -------------------------------------------------------------
-        near_resistance = (dist_vah <= level_buffer_pts) or (dist_lvn <= level_buffer_pts and close > poc)
+        near_resistance = (dist_vah <= level_buffer_pts) or (dist_lvn <= level_buffer_pts and (not np.isnan(poc) and close > poc))
         bear_confirmation = (bar["absorption_bear"] or bar["cvd_divergence_bear"]) and (delta < 0)
         vwap_res_confluence = (close >= vwap - 5.0)  # Room to fall down to VWAP / POC
 
@@ -360,7 +531,7 @@ def generate_orderflow_signals(
             sl = max(high, bar["high"] + 8.0)
             risk = sl - close
             if risk > 4.0:
-                tp_target = poc if (poc and poc < close) else (val if val and val < close else close - (1.8 * risk))
+                tp_target = poc if (not np.isnan(poc) and poc < close) else (val if not np.isnan(val) and val < close else close - (1.8 * risk))
                 tp = min(tp_target, close - (1.8 * risk))
                 df.iloc[i, df.columns.get_loc("signal")] = -1
                 df.iloc[i, df.columns.get_loc("trade_type")] = "REVERSAL_SHORT"
@@ -371,7 +542,7 @@ def generate_orderflow_signals(
         # -------------------------------------------------------------
         # C. BREAKOUT LONG (Expansion above VAH with strong Volume + Delta)
         # -------------------------------------------------------------
-        crossed_above_vah = (prev_bar["close"] <= vah + 2.0) and (close > vah + 2.0) if vah else False
+        crossed_above_vah = (prev_bar["close"] <= vah + 2.0) and (close > vah + 2.0) if not np.isnan(vah) else False
         breakout_vol_long = bar["volume"] > (1.2 * bar["vol_ma"]) and (delta > 100)
         vwap_trending_up = (close > vwap) and (vwap_slope > 0) and (bar["vwap_dist_sigma"] < 2.5)
 
@@ -389,7 +560,7 @@ def generate_orderflow_signals(
         # -------------------------------------------------------------
         # D. BREAKOUT SHORT (Expansion below VAL with strong Volume + Delta)
         # -------------------------------------------------------------
-        crossed_below_val = (prev_bar["close"] >= val - 2.0) and (close < val - 2.0) if val else False
+        crossed_below_val = (prev_bar["close"] >= val - 2.0) and (close < val - 2.0) if not np.isnan(val) else False
         breakout_vol_short = bar["volume"] > (1.2 * bar["vol_ma"]) and (delta < -100)
         vwap_trending_down = (close < vwap) and (vwap_slope < 0) and (bar["vwap_dist_sigma"] > -2.5)
 
@@ -407,19 +578,179 @@ def generate_orderflow_signals(
     return df
 
 
+def generate_prior_day_orderflow_signals(
+    bars_df: pd.DataFrame,
+    prior_rth_profile: Optional[Dict] = None,
+    eth_profile: Optional[Dict] = None,
+    max_trades_per_day: int = 2,
+    buffer_pts: float = 10.0,
+    max_sl_pts: float = 20.0,
+    min_risk_pts: float = 4.0,
+    min_rr: float = 1.8
+) -> pd.DataFrame:
+    """
+    Prior Day RTH Volume Profile Rebuilt Strategy (Zero Look-Ahead):
+    1. Primary Levels:
+       - Previous Day RTH Volume Profile (VAH, VAL, LVNs)
+       - Fully known and static before 09:30 ET
+    2. Secondary Levels:
+       - Overnight ETH Profile (VAH, VAL)
+    3. Strict Time Filters:
+       - Initial Balance (09:30 - 10:00 ET) strictly skipped!
+       - Trading Windows: 10:00 - 11:00 ET and 13:30 - 15:00 ET
+    4. Strict Entry & Acceptance/Rejection Rules:
+       - Proximity within buffer_pts (8-10 pts)
+       - Support (VAL/LVN): Low probes <= lvl + 4, candle closes bullish (close > open) back above lvl - 2
+       - Resistance (VAH/LVN): High probes >= lvl - 4, candle closes bearish (close < open) back below lvl + 2
+       - Orderflow Confirmation: (Absorption OR CVD Divergence OR Delta sign)
+       - VWAP Slope Filter:
+         * Long: vwap_slope >= -0.1 (flat or positive)
+         * Short: vwap_slope <= 0.1 (flat or negative)
+    5. Risk Management:
+       - Fixed 1 contract
+       - SL beyond swing / level (min 4 pts, max 20 pts)
+       - TP: Minimum 1:1.8 RR or Prior POC target
+       - Max 2 trades per day limit
+    """
+    df = bars_df.copy()
+    df["signal"] = 0
+    df["trade_type"] = None
+    df["stop_loss"] = np.nan
+    df["take_profit"] = np.nan
+
+    p_rth = prior_rth_profile if prior_rth_profile else eth_profile
+    eth = eth_profile
+
+    # Support levels: Prior VAL, Prior LVNs below POC, Overnight VAL
+    support_levels = []
+    if p_rth and p_rth.get("val"):
+        support_levels.append(("PRIOR_VAL", p_rth["val"]))
+    if eth and eth.get("val"):
+        support_levels.append(("ETH_VAL", eth["val"]))
+    if p_rth:
+        for lvn in p_rth.get("lvns", []):
+            if p_rth.get("poc") and lvn < p_rth["poc"]:
+                support_levels.append(("PRIOR_LVN", lvn))
+
+    # Resistance levels: Prior VAH, Prior LVNs above POC, Overnight VAH
+    resistance_levels = []
+    if p_rth and p_rth.get("vah"):
+        resistance_levels.append(("PRIOR_VAH", p_rth["vah"]))
+    if eth and eth.get("vah"):
+        resistance_levels.append(("ETH_VAH", eth["vah"]))
+    if p_rth:
+        for lvn in p_rth.get("lvns", []):
+            if p_rth.get("poc") and lvn > p_rth["poc"]:
+                resistance_levels.append(("PRIOR_LVN", lvn))
+
+    # Time filters (Eastern Time):
+    # Window 1: 10:00 - 11:00 ET (Initial Balance 09:30-10:00 strictly skipped)
+    # Window 2: 13:30 - 15:00 ET
+    w1_start = pd.to_datetime("10:00").time()
+    w1_end = pd.to_datetime("11:00").time()
+    w2_start = pd.to_datetime("13:30").time()
+    w2_end = pd.to_datetime("15:00").time()
+
+    times = df.index.time
+    in_win = ((times >= w1_start) & (times <= w1_end)) | ((times >= w2_start) & (times <= w2_end))
+
+    signals_today = 0
+
+    for i in range(1, len(df)):
+        if not in_win[i]:
+            continue
+        if signals_today >= max_trades_per_day:
+            break
+
+        bar = df.iloc[i]
+        c, o, h, l = bar["close"], bar["open"], bar["high"], bar["low"]
+        delta = bar["delta"]
+        v_slope = bar["vwap_slope"]
+
+        # --- A. LONG REVERSAL AT SUPPORT (VAL / LVN) ---
+        best_supp = None
+        min_s_dist = 999.0
+        for name, lvl in support_levels:
+            d = abs(l - lvl)
+            if d < min_s_dist:
+                min_s_dist = d
+                best_supp = (name, lvl)
+
+        if best_supp and min_s_dist <= buffer_pts:
+            s_name, s_lvl = best_supp
+            probed = l <= s_lvl + 4.0
+            rejected = (c > o) and (c >= s_lvl - 2.0)
+            confirm = (bar["absorption_bull"] or bar["cvd_divergence_bull"] or delta > 0)
+            vwap_ok = (v_slope >= -0.1)
+
+            if probed and rejected and confirm and vwap_ok:
+                raw_sl = min(l - 4.0, s_lvl - 6.0)
+                sl = max(raw_sl, c - max_sl_pts)
+                risk = c - sl
+                if risk >= min_risk_pts:
+                    poc_target = p_rth.get("poc") if p_rth else None
+                    if poc_target and poc_target > c + (min_rr * risk):
+                        tp = poc_target
+                    else:
+                        tp = c + (min_rr * risk)
+                    df.iloc[i, df.columns.get_loc("signal")] = 1
+                    df.iloc[i, df.columns.get_loc("trade_type")] = f"LONG_{s_name}"
+                    df.iloc[i, df.columns.get_loc("stop_loss")] = sl
+                    df.iloc[i, df.columns.get_loc("take_profit")] = tp
+                    signals_today += 1
+                    continue
+
+        # --- B. SHORT REVERSAL AT RESISTANCE (VAH / LVN) ---
+        best_res = None
+        min_r_dist = 999.0
+        for name, lvl in resistance_levels:
+            d = abs(h - lvl)
+            if d < min_r_dist:
+                min_r_dist = d
+                best_res = (name, lvl)
+
+        if best_res and min_r_dist <= buffer_pts:
+            r_name, r_lvl = best_res
+            probed = h >= r_lvl - 4.0
+            rejected = (c < o) and (c <= r_lvl + 2.0)
+            confirm = (bar["absorption_bear"] or bar["cvd_divergence_bear"] or delta < 0)
+            vwap_ok = (v_slope <= 0.1)
+
+            if probed and rejected and confirm and vwap_ok:
+                raw_sl = max(h + 4.0, r_lvl + 6.0)
+                sl = min(raw_sl, c + max_sl_pts)
+                risk = sl - c
+                if risk >= min_risk_pts:
+                    poc_target = p_rth.get("poc") if p_rth else None
+                    if poc_target and poc_target < c - (min_rr * risk):
+                        tp = poc_target
+                    else:
+                        tp = c - (min_rr * risk)
+                    df.iloc[i, df.columns.get_loc("signal")] = -1
+                    df.iloc[i, df.columns.get_loc("trade_type")] = f"SHORT_{r_name}"
+                    df.iloc[i, df.columns.get_loc("stop_loss")] = sl
+                    df.iloc[i, df.columns.get_loc("take_profit")] = tp
+                    signals_today += 1
+                    continue
+
+    return df
+
+
 # =============================================================================
 # 6. RISK MANAGEMENT & EXECUTION ENGINE (1 CONTRACT, CTC TRAILING SL/TP)
 # =============================================================================
 
 def simulate_orderflow_execution(
     signals_df: pd.DataFrame,
-    point_value: float = 20.0,       # $20 per point for NQ futures (Micro MNQ = $2)
-    commission_per_contract: float = 2.05,
+    point_value: float = 20.0,            # $20 per point for NQ futures (Micro MNQ = $2)
+    slippage_pts: float = 0.5,            # Realistic 0.5 pt slippage per execution
+    commission_per_contract: float = 2.25, # $4.50 round-trip commission ($2.25 per side)
     enable_trailing_ctc: bool = True
 ) -> Dict:
     """
     Order Flow Strategy ka Event-Driven Execution Simulator:
     - Fixed 1 contract position
+    - Realistic Friction: 0.5 pt slippage/side ($20/trade) + $4.50 RT commission ($24.50 total friction)
     - Dynamic Stop Loss & 1:1.8+ RR Take Profit
     - Trailing Stop Loss (CTC style - Close to Close / Breakeven lock)
     """
@@ -427,11 +758,15 @@ def simulate_orderflow_execution(
     trades: List[Dict] = []
     current_position = 0  # 1: Long, -1: Short, 0: Flat
     entry_price = 0.0
+    actual_entry_price = 0.0
     entry_time = None
     stop_loss = 0.0
     take_profit = 0.0
     trade_type = ""
     is_breakeven_set = False
+    initial_risk_pts = 10.0
+
+    comm_rt = commission_per_contract * 2.0
 
     for i in range(len(df)):
         bar = df.iloc[i]
@@ -447,40 +782,37 @@ def simulate_orderflow_execution(
         if current_position == 1:
             # Check Stop Loss
             if low <= stop_loss:
-                exit_price = stop_loss
-                pnl_pts = exit_price - entry_price
-                pnl_usd = (pnl_pts * point_value) - (commission_per_contract * 2)
+                actual_exit_price = stop_loss - slippage_pts
+                pnl_pts = actual_exit_price - actual_entry_price
+                pnl_usd = (pnl_pts * point_value) - comm_rt
                 trades.append({
                     "entry_time": entry_time, "exit_time": time, "type": trade_type,
-                    "direction": "LONG", "entry_price": entry_price, "exit_price": exit_price,
-                    "pnl_pts": pnl_pts, "pnl_usd": pnl_usd, "exit_reason": "STOP_LOSS"
+                    "direction": "LONG", "entry_price": actual_entry_price, "exit_price": actual_exit_price,
+                    "pnl_pts": pnl_pts, "pnl_usd": pnl_usd,
+                    "exit_reason": "BREAKEVEN_STOP" if is_breakeven_set else "STOP_LOSS"
                 })
                 current_position = 0
                 continue
 
             # Check Take Profit
             if high >= take_profit:
-                exit_price = take_profit
-                pnl_pts = exit_price - entry_price
-                pnl_usd = (pnl_pts * point_value) - (commission_per_contract * 2)
+                actual_exit_price = take_profit - slippage_pts
+                pnl_pts = actual_exit_price - actual_entry_price
+                pnl_usd = (pnl_pts * point_value) - comm_rt
                 trades.append({
                     "entry_time": entry_time, "exit_time": time, "type": trade_type,
-                    "direction": "LONG", "entry_price": entry_price, "exit_price": exit_price,
+                    "direction": "LONG", "entry_price": actual_entry_price, "exit_price": actual_exit_price,
                     "pnl_pts": pnl_pts, "pnl_usd": pnl_usd, "exit_reason": "TAKE_PROFIT"
                 })
                 current_position = 0
                 continue
 
             # CTC Trailing Management:
-            # Agar trade 1R profit me chala jaye -> SL moves to Breakeven
-            # Aur closer trailing start hoti hai
             if enable_trailing_ctc:
-                risk_pts = entry_price - bar.get("stop_loss", entry_price - 10.0)
-                if not is_breakeven_set and (high - entry_price) >= abs(risk_pts):
+                if not is_breakeven_set and (high - entry_price) >= initial_risk_pts:
                     stop_loss = entry_price + 1.0  # Lock Breakeven + 1 pt
                     is_breakeven_set = True
                 elif is_breakeven_set:
-                    # Trail SL behind previous bar's low
                     new_sl = bar["low"] - 3.0
                     if new_sl > stop_loss:
                         stop_loss = new_sl
@@ -488,25 +820,26 @@ def simulate_orderflow_execution(
         elif current_position == -1:
             # Check Stop Loss
             if high >= stop_loss:
-                exit_price = stop_loss
-                pnl_pts = entry_price - exit_price
-                pnl_usd = (pnl_pts * point_value) - (commission_per_contract * 2)
+                actual_exit_price = stop_loss + slippage_pts
+                pnl_pts = actual_entry_price - actual_exit_price
+                pnl_usd = (pnl_pts * point_value) - comm_rt
                 trades.append({
                     "entry_time": entry_time, "exit_time": time, "type": trade_type,
-                    "direction": "SHORT", "entry_price": entry_price, "exit_price": exit_price,
-                    "pnl_pts": pnl_pts, "pnl_usd": pnl_usd, "exit_reason": "STOP_LOSS"
+                    "direction": "SHORT", "entry_price": actual_entry_price, "exit_price": actual_exit_price,
+                    "pnl_pts": pnl_pts, "pnl_usd": pnl_usd,
+                    "exit_reason": "BREAKEVEN_STOP" if is_breakeven_set else "STOP_LOSS"
                 })
                 current_position = 0
                 continue
 
             # Check Take Profit
             if low <= take_profit:
-                exit_price = take_profit
-                pnl_pts = entry_price - exit_price
-                pnl_usd = (pnl_pts * point_value) - (commission_per_contract * 2)
+                actual_exit_price = take_profit + slippage_pts
+                pnl_pts = actual_entry_price - actual_exit_price
+                pnl_usd = (pnl_pts * point_value) - comm_rt
                 trades.append({
                     "entry_time": entry_time, "exit_time": time, "type": trade_type,
-                    "direction": "SHORT", "entry_price": entry_price, "exit_price": exit_price,
+                    "direction": "SHORT", "entry_price": actual_entry_price, "exit_price": actual_exit_price,
                     "pnl_pts": pnl_pts, "pnl_usd": pnl_usd, "exit_reason": "TAKE_PROFIT"
                 })
                 current_position = 0
@@ -514,9 +847,8 @@ def simulate_orderflow_execution(
 
             # CTC Trailing Management for Short:
             if enable_trailing_ctc:
-                risk_pts = bar.get("stop_loss", entry_price + 10.0) - entry_price
-                if not is_breakeven_set and (entry_price - low) >= abs(risk_pts):
-                    stop_loss = entry_price - 1.0  # Lock Breakeven
+                if not is_breakeven_set and (entry_price - low) >= initial_risk_pts:
+                    stop_loss = entry_price - 1.0  # Lock Breakeven - 1 pt
                     is_breakeven_set = True
                 elif is_breakeven_set:
                     new_sl = bar["high"] + 3.0
@@ -529,22 +861,29 @@ def simulate_orderflow_execution(
         if current_position == 0 and signal != 0:
             current_position = signal
             entry_price = close
+            actual_entry_price = close + slippage_pts if signal == 1 else close - slippage_pts
             entry_time = time
             stop_loss = bar["stop_loss"]
             take_profit = bar["take_profit"]
             trade_type = bar["trade_type"]
+            initial_risk_pts = abs(entry_price - stop_loss) if (stop_loss and not np.isnan(stop_loss)) else 10.0
             is_breakeven_set = False
 
     # Close any open trade at end of data
     if current_position != 0:
         last_bar = df.iloc[-1]
         exit_price = last_bar["close"]
-        pnl_pts = (exit_price - entry_price) if current_position == 1 else (entry_price - exit_price)
-        pnl_usd = (pnl_pts * point_value) - (commission_per_contract * 2)
+        if current_position == 1:
+            actual_exit_price = exit_price - slippage_pts
+            pnl_pts = actual_exit_price - actual_entry_price
+        else:
+            actual_exit_price = exit_price + slippage_pts
+            pnl_pts = actual_entry_price - actual_exit_price
+        pnl_usd = (pnl_pts * point_value) - comm_rt
         trades.append({
             "entry_time": entry_time, "exit_time": df.index[-1], "type": trade_type,
             "direction": "LONG" if current_position == 1 else "SHORT",
-            "entry_price": entry_price, "exit_price": exit_price,
+            "entry_price": actual_entry_price, "exit_price": actual_exit_price,
             "pnl_pts": pnl_pts, "pnl_usd": pnl_usd, "exit_reason": "END_OF_SESSION"
         })
 
@@ -604,10 +943,10 @@ def run_orderflow_strategy_pipeline(
     Advanced Order Flow Strategy ka complete pipeline:
     1. Resample to entry timeframe (3min ya 5min) with tick delta & CVD
     2. Session-anchored VWAP & Bands
-    3. RTH & ETH Volume Profiles (POC, VAH, VAL, LVN)
+    3. Causal Expanding Volume Profiles (RTH & ETH) bar-by-bar
     4. Order Flow Confirmations (Absorption, CVD Divergence, Delta flip)
     5. Reversal & Breakout Signals
-    6. Risk Management & CTC Trailing Simulation
+    6. Risk Management & CTC Trailing Simulation with realistic friction
     7. VectorBT Portfolio Backtest
     """
     print(f"\n--- [Step 1] Building {entry_timeframe} Order Flow Bars ---")
@@ -617,12 +956,17 @@ def run_orderflow_strategy_pipeline(
     print("\n--- [Step 2] Computing Session VWAP & Bands ---")
     bars = calculate_smart_vwap(bars)
 
-    print("\n--- [Step 3] Calculating 15-min Volume Profiles (RTH & ETH) ---")
-    profiles = compute_session_profiles(trades_df, tick_size=tick_size)
+    print("\n--- [Step 3] Calculating Causal Expanding Volume Profiles ---")
+    profiles = compute_session_profiles(trades_df, bar_index=bars.index, tick_size=tick_size)
+    if "expanding" in profiles:
+        exp_df = profiles["expanding"]
+        for col in exp_df.columns:
+            bars[col] = exp_df[col].values
+
     rth_p = profiles["rth"]
     eth_p = profiles["eth"]
-    print(f"RTH Profile -> POC: {rth_p['poc']}, VAH: {rth_p['vah']}, VAL: {rth_p['val']}, LVNs: {len(rth_p['lvns'])}")
-    print(f"ETH Profile -> POC: {eth_p['poc']}, VAH: {eth_p['vah']}, VAL: {eth_p['val']}, LVNs: {len(eth_p['lvns'])}")
+    print(f"Overnight ETH Profile -> POC: {eth_p['poc']}, VAH: {eth_p['vah']}, VAL: {eth_p['val']}")
+    print(f"Final RTH Profile     -> POC: {rth_p['poc']}, VAH: {rth_p['vah']}, VAL: {rth_p['val']}")
 
     print("\n--- [Step 4] Detecting Order Flow Confirmations (Absorption & CVD Divergence) ---")
     bars = detect_orderflow_features(bars)
@@ -632,8 +976,13 @@ def run_orderflow_strategy_pipeline(
     total_signals = (bars["signal"] != 0).sum()
     print(f"Generated {total_signals} actionable signal(s) in designated windows.")
 
-    print("\n--- [Step 6] Running Risk Management Simulation (1 Contract, CTC Trailing) ---")
-    sim_results = simulate_orderflow_execution(bars, point_value=point_value)
+    print("\n--- [Step 6] Running Risk Management Simulation (1 Contract, CTC Trailing, Friction) ---")
+    sim_results = simulate_orderflow_execution(
+        bars,
+        point_value=point_value,
+        slippage_pts=0.5,
+        commission_per_contract=2.25
+    )
 
     vbt_portfolio = None
     if enable_vbt and total_signals > 0:

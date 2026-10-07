@@ -9,6 +9,7 @@ Processes high-frequency .dbn.zst files sequentially:
 """
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import gc
 import time
 from pathlib import Path
@@ -20,22 +21,76 @@ import pandas as pd
 from strategies.volume_profile_strategy import (
     build_orderflow_bars,
     calculate_smart_vwap,
-    compute_session_profiles,
+    calculate_volume_profile,
     detect_orderflow_features,
-    generate_orderflow_signals,
+    generate_prior_day_orderflow_signals,
     simulate_orderflow_execution,
 )
 
 
+def extract_session_profile(file_path: Path) -> Optional[Dict]:
+    """
+    Ek single .dbn.zst file se RTH aur ETH volume profiles extract karta hai.
+    """
+    try:
+        st = db.DBNStore.from_file(file_path)
+        df = st.to_df()
+        del st
+
+        outright = df[~df["symbol"].str.contains("-")]
+        if outright.empty:
+            del df, outright
+            gc.collect()
+            return None
+
+        top_symbol = outright["symbol"].value_counts().index[0]
+        df_filtered = outright[outright["symbol"] == top_symbol].copy()
+        del df, outright
+
+        if df_filtered.index.tz is None:
+            df_filtered.index = df_filtered.index.tz_localize("UTC").tz_convert("America/New_York")
+        else:
+            df_filtered.index = df_filtered.index.tz_convert("America/New_York")
+
+        times = df_filtered.index.time
+        rth_start = pd.to_datetime("09:30").time()
+        rth_end = pd.to_datetime("16:00").time()
+        rth_trades = df_filtered[(times >= rth_start) & (times < rth_end)]
+        eth_trades = df_filtered[times < rth_start]
+
+        if len(rth_trades) < 200:
+            del df_filtered, rth_trades, eth_trades
+            gc.collect()
+            return None
+
+        session_date = df_filtered.index[0].strftime("%Y-%m-%d")
+        rth_prof = calculate_volume_profile(rth_trades["price"], rth_trades["size"], tick_size=1.0)
+        eth_prof = calculate_volume_profile(eth_trades["price"], eth_trades["size"], tick_size=1.0)
+
+        del df_filtered, rth_trades, eth_trades
+        gc.collect()
+
+        return {
+            "date": session_date,
+            "file_path": file_path,
+            "rth": rth_prof,
+            "eth": eth_prof
+        }
+    except Exception as e:
+        gc.collect()
+        return None
+
+
 def run_single_file_backtest(
     file_path: Path,
+    prior_rth_profile: Optional[Dict],
+    eth_profile: Optional[Dict],
     timeframe: str = "5min",
     tick_size: float = 1.0,
     point_value: float = 20.0
 ) -> Optional[pd.DataFrame]:
     """
-    Ek single .dbn.zst file ko read karke trade simulation run karta hai
-    aur uss din ke trades ka DataFrame return karta hai. Memory free kar deta hai.
+    Prior Day Volume Profile + Strict Filters ke saath single day backtest run karta hai.
     """
     try:
         st = db.DBNStore.from_file(file_path)
@@ -60,7 +115,7 @@ def run_single_file_backtest(
         else:
             df_filtered.index = df_filtered.index.tz_convert("America/New_York")
 
-        # RTH session check (Weekend / Sunday short sessions skip karna)
+        # RTH session check
         times = df_filtered.index.time
         rth_start = pd.to_datetime("09:30").time()
         rth_end = pd.to_datetime("16:00").time()
@@ -71,18 +126,36 @@ def run_single_file_backtest(
             gc.collect()
             return None
 
-        # Pipeline execution
+        # Build orderflow bars & features
         bars = build_orderflow_bars(df_filtered, timeframe=timeframe)
         bars = calculate_smart_vwap(bars)
-        profiles = compute_session_profiles(df_filtered, tick_size=tick_size)
         bars = detect_orderflow_features(bars)
-        bars = generate_orderflow_signals(bars, profiles)
-        sim_res = simulate_orderflow_execution(bars, point_value=point_value)
+
+        del df_filtered
+        gc.collect()
+
+        # Prior Day RTH + Overnight ETH Strategy Signals
+        bars = generate_prior_day_orderflow_signals(
+            bars_df=bars,
+            prior_rth_profile=prior_rth_profile,
+            eth_profile=eth_profile,
+            max_trades_per_day=2,
+            buffer_pts=10.0,
+            max_sl_pts=20.0,
+            min_risk_pts=4.0,
+            min_rr=1.8
+        )
+
+        sim_res = simulate_orderflow_execution(
+            bars,
+            point_value=point_value,
+            slippage_pts=0.5,
+            commission_per_contract=2.25,
+            enable_trailing_ctc=True
+        )
 
         day_trades = sim_res["trades_df"]
-
-        # Clean up memory
-        del df_filtered, bars, profiles, sim_res
+        del bars, sim_res
         gc.collect()
 
         return day_trades
@@ -196,10 +269,11 @@ def run_multi_day_backtest(
     timeframe: str = "5min",
     max_files: Optional[int] = None,
     point_value: float = 20.0,
-    output_dir: str = "results"
+    output_dir: str = "results",
+    workers: int = 4
 ) -> Dict:
     """
-    data/ directory ke saare .dbn.zst files ko sequentially process karta hai.
+    data/ directory ke saare .dbn.zst files ko parallel workers ke sath process karta hai.
     """
     path = Path(data_dir)
     all_files = sorted(list(path.glob("*.trades.dbn.zst")))
@@ -213,36 +287,108 @@ def run_multi_day_backtest(
 
     total_files = len(all_files)
     print("=" * 70)
-    print(f"      STARTING MULTI-DAY ORDER FLOW BACKTEST ({total_files} FILES)")
+    print(f"      STARTING MULTI-DAY CAUSAL ORDER FLOW BACKTEST ({total_files} FILES)")
     print(f"      Timeframe: {timeframe} | NQ Futures ($20/pt) | Fixed 1 Contract")
+    print(f"      Execution: 0.5 pt Slippage/side + $4.50 RT Commission | Workers: {workers}")
     print("=" * 70)
 
     start_time = time.time()
     collected_trades: List[pd.DataFrame] = []
+
+    print("\n[PHASE 1/2] Pre-calculating Daily Volume Profiles (Static Zero Look-Ahead)...")
+    t_phase1 = time.time()
+    valid_sessions = []
+
+    if workers and workers > 1:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            fut_map = {executor.submit(extract_session_profile, fp): fp for fp in all_files}
+            done_cnt = 0
+            for fut in as_completed(fut_map):
+                done_cnt += 1
+                pct = (done_cnt / total_files) * 100.0
+                print(f"  Extracting Profiles: [{done_cnt:3d}/{total_files:3d}] ({pct:5.1f}%)...", end="\r", flush=True)
+                res = fut.result()
+                if res is not None:
+                    valid_sessions.append(res)
+    else:
+        for idx, fp in enumerate(all_files, 1):
+            pct = (idx / total_files) * 100.0
+            print(f"  Extracting Profiles: [{idx:3d}/{total_files:3d}] ({pct:5.1f}%)...", end="\r", flush=True)
+            res = extract_session_profile(fp)
+            if res is not None:
+                valid_sessions.append(res)
+
+    valid_sessions.sort(key=lambda x: x["date"])
+    print(f"\n[DONE Phase 1] Extracted {len(valid_sessions)} valid trading sessions in {time.time() - t_phase1:.1f}s.")
+
+    # Assign Prior Day RTH Volume Profile chronologically (zero look-ahead, 100% known at 09:30 ET)
+    sim_tasks = []
+    for idx, s in enumerate(valid_sessions):
+        prior_rth = valid_sessions[idx - 1]["rth"] if idx > 0 else None
+        sim_tasks.append({
+            "file_path": s["file_path"],
+            "date": s["date"],
+            "prior_rth": prior_rth,
+            "eth": s["eth"]
+        })
+
+    print("\n[PHASE 2/2] Simulating Prior-Day Order Flow Execution (Time Filters & Realistic Friction)...")
+    t_phase2 = time.time()
+    total_sim = len(sim_tasks)
     days_with_trades = 0
     days_skipped = 0
 
-    for idx, file_path in enumerate(all_files, 1):
-        elapsed = time.time() - start_time
-        pct_done = (idx / total_files) * 100.0
-        print(f"[{idx:3d}/{total_files:3d}] ({pct_done:5.1f}%) Processing: {file_path.name}...", end="\r", flush=True)
-
-        day_trades = run_single_file_backtest(
-            file_path=file_path,
-            timeframe=timeframe,
-            tick_size=1.0,
-            point_value=point_value
-        )
-
-        if day_trades is not None and not day_trades.empty:
-            collected_trades.append(day_trades)
-            days_with_trades += 1
-        elif day_trades is None:
-            days_skipped += 1
+    if workers and workers > 1:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            fut_map = {
+                executor.submit(
+                    run_single_file_backtest,
+                    task["file_path"],
+                    task["prior_rth"],
+                    task["eth"],
+                    timeframe,
+                    1.0,
+                    point_value
+                ): task for task in sim_tasks
+            }
+            done_cnt = 0
+            for fut in as_completed(fut_map):
+                done_cnt += 1
+                pct = (done_cnt / total_sim) * 100.0
+                print(f"  Simulating Days: [{done_cnt:3d}/{total_sim:3d}] ({pct:5.1f}%)...", end="\r", flush=True)
+                try:
+                    day_trades = fut.result()
+                    if day_trades is not None and not day_trades.empty:
+                        collected_trades.append(day_trades)
+                        days_with_trades += 1
+                    else:
+                        days_skipped += 1
+                except Exception as e:
+                    task = fut_map[fut]
+                    print(f"\nError simulating {task['date']}: {e}")
+                    days_skipped += 1
+    else:
+        for idx, task in enumerate(sim_tasks, 1):
+            pct = (idx / total_sim) * 100.0
+            print(f"  Simulating Days: [{idx:3d}/{total_sim:3d}] ({pct:5.1f}%)...", end="\r", flush=True)
+            day_trades = run_single_file_backtest(
+                task["file_path"],
+                task["prior_rth"],
+                task["eth"],
+                timeframe,
+                1.0,
+                point_value
+            )
+            if day_trades is not None and not day_trades.empty:
+                collected_trades.append(day_trades)
+                days_with_trades += 1
+            else:
+                days_skipped += 1
 
     total_duration = time.time() - start_time
-    print(f"\n[DONE] Finished processing {total_files} files in {total_duration:.1f}s ({total_duration/total_files:.2f}s/file).")
-    print(f"       Days with trades: {days_with_trades} | Skipped/Weekend days: {days_skipped}")
+    print(f"\n[DONE Phase 2] Completed strategy simulation in {time.time() - t_phase2:.1f}s.")
+    print(f"[TOTAL TIME] Entire 1-Year dataset processed in {total_duration:.1f}s.")
+    print(f"             Trading Days with trades: {days_with_trades} | Days skipped: {days_skipped}")
 
     if not collected_trades:
         print("[!] Kisi bhi din par trade signal generate nahi hua.")
@@ -280,13 +426,15 @@ def main():
     parser.add_argument("--timeframe", choices=["3min", "5min"], default="5min", help="Candle timeframe (default: 5min)")
     parser.add_argument("--max_files", type=int, default=None, help="Limit number of files (default: all)")
     parser.add_argument("--point_value", type=float, default=20.0, help="Contract point value (default: 20 for NQ, 2 for MNQ)")
+    parser.add_argument("--workers", type=int, default=4, help="Number of parallel workers (default: 4)")
     args = parser.parse_args()
 
     results = run_multi_day_backtest(
         data_dir="data",
         timeframe=args.timeframe,
         max_files=args.max_files,
-        point_value=args.point_value
+        point_value=args.point_value,
+        workers=args.workers
     )
 
     if not results:
