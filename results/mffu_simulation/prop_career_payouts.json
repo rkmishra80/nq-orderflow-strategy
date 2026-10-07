@@ -1,0 +1,158 @@
+{
+  "eval_attempts": 5,
+  "eval_passes": 4,
+  "eval_fails": 1,
+  "funded_accounts": 4,
+  "funded_blown": 3,
+  "total_payouts_usd": 37800.0,
+  "total_payout_events": 21,
+  "payout_records": [
+    {
+      "date": "2025-10-02 00:00:00",
+      "funded_account_id": 1,
+      "gross_payout": 2000.0,
+      "net_payout_90pct": 1800.0,
+      "remaining_balance": 54625.49999999994
+    },
+    {
+      "date": "2025-11-20 00:00:00",
+      "funded_account_id": 4,
+      "gross_payout": 2000.0,
+      "net_payout_90pct": 1800.0,
+      "remaining_balance": 64221.500000000044
+    },
+    {
+      "date": "2025-12-04 00:00:00",
+      "funded_account_id": 4,
+      "gross_payout": 2000.0,
+      "net_payout_90pct": 1800.0,
+      "remaining_balance": 71272.50000000006
+    },
+    {
+      "date": "2025-12-19 00:00:00",
+      "funded_account_id": 4,
+      "gross_payout": 2000.0,
+      "net_payout_90pct": 1800.0,
+      "remaining_balance": 79057.00000000012
+    },
+    {
+      "date": "2026-01-07 00:00:00",
+      "funded_account_id": 4,
+      "gross_payout": 2000.0,
+      "net_payout_90pct": 1800.0,
+      "remaining_balance": 88256.5000000001
+    },
+    {
+      "date": "2026-01-21 00:00:00",
+      "funded_account_id": 4,
+      "gross_payout": 2000.0,
+      "net_payout_90pct": 1800.0,
+      "remaining_balance": 95806.50000000009
+    },
+    {
+      "date": "2026-02-05 00:00:00",
+      "funded_account_id": 4,
+      "gross_payout": 2000.0,
+      "net_payout_90pct": 1800.0,
+      "remaining_balance": 104286.50000000013
+    },
+    {
+      "date": "2026-02-20 00:00:00",
+      "funded_account_id": 4,
+      "gross_payout": 2000.0,
+      "net_payout_90pct": 1800.0,
+      "remaining_balance": 115008.50000000013
+    },
+    {
+      "date": "2026-03-06 00:00:00",
+      "funded_account_id": 4,
+      "gross_payout": 2000.0,
+      "net_payout_90pct": 1800.0,
+      "remaining_balance": 134754.0000000002
+    },
+    {
+      "date": "2026-03-20 00:00:00",
+      "funded_account_id": 4,
+      "gross_payout": 2000.0,
+      "net_payout_90pct": 1800.0,
+      "remaining_balance": 144905.50000000023
+    },
+    {
+      "date": "2026-04-06 00:00:00",
+      "funded_account_id": 4,
+      "gross_payout": 2000.0,
+      "net_payout_90pct": 1800.0,
+      "remaining_balance": 147586.00000000015
+    },
+    {
+      "date": "2026-04-20 00:00:00",
+      "funded_account_id": 4,
+      "gross_payout": 2000.0,
+      "net_payout_90pct": 1800.0,
+      "remaining_balance": 147022.00000000015
+    },
+    {
+      "date": "2026-05-05 00:00:00",
+      "funded_account_id": 4,
+      "gross_payout": 2000.0,
+      "net_payout_90pct": 1800.0,
+      "remaining_balance": 149067.00000000017
+    },
+    {
+      "date": "2026-05-21 00:00:00",
+      "funded_account_id": 4,
+      "gross_payout": 2000.0,
+      "net_payout_90pct": 1800.0,
+      "remaining_balance": 147621.00000000017
+    },
+    {
+      "date": "2026-06-04 00:00:00",
+      "funded_account_id": 4,
+      "gross_payout": 2000.0,
+      "net_payout_90pct": 1800.0,
+      "remaining_balance": 164614.0000000001
+    },
+    {
+      "date": "2026-06-22 00:00:00",
+      "funded_account_id": 4,
+      "gross_payout": 2000.0,
+      "net_payout_90pct": 1800.0,
+      "remaining_balance": 189022.50000000012
+    },
+    {
+      "date": "2026-07-07 00:00:00",
+      "funded_account_id": 4,
+      "gross_payout": 2000.0,
+      "net_payout_90pct": 1800.0,
+      "remaining_balance": 198631.50000000012
+    },
+    {
+      "date": "2026-07-21 00:00:00",
+      "funded_account_id": 4,
+      "gross_payout": 2000.0,
+      "net_payout_90pct": 1800.0,
+      "remaining_balance": 212651.50000000003
+    },
+    {
+      "date": "2026-08-05 00:00:00",
+      "funded_account_id": 4,
+      "gross_payout": 2000.0,
+      "net_payout_90pct": 1800.0,
+      "remaining_balance": 212229.5
+    },
+    {
+      "date": "2026-08-20 00:00:00",
+      "funded_account_id": 4,
+      "gross_payout": 2000.0,
+      "net_payout_90pct": 1800.0,
+      "remaining_balance": 232782.5000000001
+    },
+    {
+      "date": "2026-09-03 00:00:00",
+      "funded_account_id": 4,
+      "gross_payout": 2000.0,
+      "net_payout_90pct": 1800.0,
+      "remaining_balance": 231649.0
+    }
+  ]
+}
